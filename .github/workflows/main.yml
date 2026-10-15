@@ -10,23 +10,14 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+
     env:
       BUILD_TOOLS: "34.0.0"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      ANDROID_PLATFORM: "android-34"
 
-      - name: Unzip project
-        run: |
-          set -e
-          ZIP=$(ls -1 *.zip 2>/dev/null | head -n 1)
-          if [ -z "$ZIP" ]; then echo "هیچ فایل zip در ریشه مخزن پیدا نشد"; exit 1; fi
-          echo "Using $ZIP"
-          mkdir -p extracted
-          unzip -q -o "$ZIP" -d extracted
-          SETTINGS=$(find extracted -maxdepth 3 -name settings.gradle.kts | head -n 1)
-          if [ -z "$SETTINGS" ]; then echo "settings.gradle.kts داخل zip پیدا نشد"; exit 1; fi
-          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -36,72 +27,146 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
-      - name: Install build tools and platform
-        run: sdkmanager "build-tools;${BUILD_TOOLS}" "platforms;android-34"
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager \
+            "platform-tools" \
+            "platforms;${ANDROID_PLATFORM}" \
+            "build-tools;${BUILD_TOOLS}"
+
+      - name: Find and extract project ZIP
+        run: |
+          set -euo pipefail
+
+          ZIP="SchoolLeague-final.zip"
+
+          if [ ! -f "$ZIP" ]; then
+            echo "::error::SchoolLeague-final.zip was not found in repository root."
+            exit 1
+          fi
+
+          mkdir -p extracted
+          unzip -q -o "$ZIP" -d extracted
+
+          SETTINGS="$(find extracted -maxdepth 5 \
+            \( -name settings.gradle.kts -o -name settings.gradle \) \
+            -print -quit)"
+
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::No Gradle settings file found inside ZIP."
+            find extracted -maxdepth 4 -type f | head -100
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+          echo "Found project at: $(dirname "$SETTINGS")"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.7"
 
-      - name: Unit tests
+      - name: Run unit tests
         working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle testDebugUnitTest --no-daemon --stacktrace
+        run: |
+          set -e
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew testDebugUnitTest --no-daemon --stacktrace
+          else
+            gradle testDebugUnitTest --no-daemon --stacktrace
+          fi
 
-      - name: Build release APK (unsigned)
+      - name: Build release APK
         working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle assembleRelease --no-daemon --stacktrace
+        run: |
+          set -e
+          if [ -f ./gradlew ]; then
+            ./gradlew assembleRelease --no-daemon --stacktrace
+          else
+            gradle assembleRelease --no-daemon --stacktrace
+          fi
 
-      - name: Prepare keystore
+      - name: Prepare signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          set -e
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "Using keystore from GitHub Secrets"
-            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
-            echo "KS_PASS=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
-            echo "KEY_ALIAS_V=$KEY_ALIAS" >> "$GITHUB_ENV"
-            echo "KEY_PASS=$KEY_PASSWORD" >> "$GITHUB_ENV"
-          else
-            echo "::warning::Secrets not set. Using a temporary self-signed key (changes every build)."
-            TMP_PASS="temp-$(date +%s)"
-            keytool -genkeypair -v -keystore "$RUNNER_TEMP/release.jks" \
-              -alias tempkey -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "$TMP_PASS" -keypass "$TMP_PASS" \
-              -dname "CN=SchoolLeague, O=Temp, C=IR"
-            echo "KS_PASS=$TMP_PASS" >> "$GITHUB_ENV"
-            echo "KEY_ALIAS_V=tempkey" >> "$GITHUB_ENV"
-            echo "KEY_PASS=$TMP_PASS" >> "$GITHUB_ENV"
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/signing"
+
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "::error::Missing KEYSTORE_BASE64 GitHub Secret."
+            exit 1
           fi
+
+          echo "$KEYSTORE_BASE64" | base64 --decode \
+            > "$RUNNER_TEMP/signing/release.jks"
+
+          test -s "$RUNNER_TEMP/signing/release.jks"
+
+          echo "KS_PATH=$RUNNER_TEMP/signing/release.jks" >> "$GITHUB_ENV"
 
       - name: Align and sign APK
         working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          set -e
+          set -euo pipefail
+
           BT="$ANDROID_HOME/build-tools/${BUILD_TOOLS}"
-          IN=$(find app/build/outputs/apk/release -name "*-unsigned.apk" | head -n 1)
-          if [ -z "$IN" ]; then echo "APK بدون امضا پیدا نشد"; exit 1; fi
+          APK_DIR="app/build/outputs/apk/release"
+
+          if [ -z "${KEYSTORE_PASSWORD:-}" ] || \
+             [ -z "${KEY_ALIAS:-}" ] || \
+             [ -z "${KEY_PASSWORD:-}" ]; then
+            echo "::error::One or more signing Secrets are missing."
+            exit 1
+          fi
+
+          IN="$(find "$APK_DIR" -maxdepth 1 -type f \
+            -name '*.apk' ! -name '*-unsigned-aligned.apk' \
+            -print -quit)"
+
+          if [ -z "$IN" ]; then
+            echo "::error::No release APK found."
+            find app/build/outputs -type f -name '*.apk' || true
+            exit 1
+          fi
+
           mkdir -p "$GITHUB_WORKSPACE/out"
-          "$BT/zipalign" -f -p 4 "$IN" "$RUNNER_TEMP/aligned.apk"
-          KS_PASS="$KS_PASS" KEY_PASS="$KEY_PASS" "$BT/apksigner" sign \
-            --ks "$RUNNER_TEMP/release.jks" \
-            --ks-key-alias "$KEY_ALIAS_V" \
+
+          "$BT/zipalign" -f -p 4 \
+            "$IN" "$RUNNER_TEMP/aligned.apk"
+
+          KS_PASS="$KEYSTORE_PASSWORD" \
+          KEY_PASS="$KEY_PASSWORD" \
+          "$BT/apksigner" sign \
+            --ks "$KS_PATH" \
+            --ks-key-alias "$KEY_ALIAS" \
             --ks-pass env:KS_PASS \
             --key-pass env:KEY_PASS \
             --out "$GITHUB_WORKSPACE/out/SchoolLeague-release-signed.apk" \
             "$RUNNER_TEMP/aligned.apk"
-          "$BT/apksigner" verify --verbose "$GITHUB_WORKSPACE/out/SchoolLeague-release-signed.apk"
 
-      - name: Cleanup keystore
+          "$BT/apksigner" verify --verbose \
+            "$GITHUB_WORKSPACE/out/SchoolLeague-release-signed.apk"
+
+      - name: Clean up signing key
         if: always()
-        run: rm -f "$RUNNER_TEMP/release.jks"
+        run: rm -rf "$RUNNER_TEMP/signing" "$RUNNER_TEMP/aligned.apk"
 
       - name: Upload signed APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: SchoolLeague-signed-apk
