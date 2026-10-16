@@ -7,17 +7,45 @@ on:
 permissions:
   contents: read
 
+env:
+  ZIP_NAME: SchoolLeague-final.zip
+  BUILD_TOOLS: "34.0.0"
+
 jobs:
   build:
     runs-on: ubuntu-24.04
-
-    env:
-      BUILD_TOOLS: "34.0.0"
-      ANDROID_PLATFORM: "android-34"
-
+    timeout-minutes: 40
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Check signing secrets exist (values are never printed)
+        env:
+          S1: ${{ secrets.KEYSTORE_BASE64 }}
+          S2: ${{ secrets.KEYSTORE_PASSWORD }}
+          S3: ${{ secrets.KEY_ALIAS }}
+          S4: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          missing=0
+          [ -n "$S1" ] || { echo "::error::Secret KEYSTORE_BASE64 is empty or missing"; missing=1; }
+          [ -n "$S2" ] || { echo "::error::Secret KEYSTORE_PASSWORD is empty or missing"; missing=1; }
+          [ -n "$S3" ] || { echo "::error::Secret KEY_ALIAS is empty or missing"; missing=1; }
+          [ -n "$S4" ] || { echo "::error::Secret KEY_PASSWORD is empty or missing"; missing=1; }
+          exit $missing
+
+      - name: Unzip project
+        run: |
+          set -e
+          test -f "$ZIP_NAME" || { echo "::error::$ZIP_NAME not found in repository root"; ls -la; exit 1; }
+          rm -rf extracted && mkdir extracted
+          unzip -q "$ZIP_NAME" -d extracted
+          SETTINGS=$(find extracted -maxdepth 3 \( -name settings.gradle.kts -o -name settings.gradle \) | head -n 1)
+          test -n "$SETTINGS" || { echo "::error::settings.gradle(.kts) not found inside zip"; find extracted -maxdepth 3; exit 1; }
+          DIR=$(cd "$(dirname "$SETTINGS")" && pwd)
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "Project directory: $DIR"
+          echo "--- AGP / Kotlin versions:"; grep -n "version" "$DIR/build.gradle.kts" || true
+          test -f "$DIR/app/build.gradle.kts" -o -f "$DIR/app/build.gradle" || { echo "::error::app module not found"; exit 1; }
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -27,148 +55,93 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: ''
 
-      - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses || true
-
-      - name: Install Android SDK packages
+      - name: Install SDK platform and build tools
         run: |
-          sdkmanager \
-            "platform-tools" \
-            "platforms;${ANDROID_PLATFORM}" \
-            "build-tools;${BUILD_TOOLS}"
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;${BUILD_TOOLS}"
 
-      - name: Find and extract project ZIP
-        run: |
-          set -euo pipefail
-
-          ZIP="SchoolLeague-final.zip"
-
-          if [ ! -f "$ZIP" ]; then
-            echo "::error::SchoolLeague-final.zip was not found in repository root."
-            exit 1
-          fi
-
-          mkdir -p extracted
-          unzip -q -o "$ZIP" -d extracted
-
-          SETTINGS="$(find extracted -maxdepth 5 \
-            \( -name settings.gradle.kts -o -name settings.gradle \) \
-            -print -quit)"
-
-          if [ -z "$SETTINGS" ]; then
-            echo "::error::No Gradle settings file found inside ZIP."
-            find extracted -maxdepth 4 -type f | head -100
-            exit 1
-          fi
-
-          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
-          echo "Found project at: $(dirname "$SETTINGS")"
-
-      - name: Set up Gradle
+      - name: Set up Gradle 8.7 (pinned, compatible with AGP 8.5.2)
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
 
-      - name: Run unit tests
+      - name: Build release APK (unsigned)
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          set -e
-          if [ -f ./gradlew ]; then
-            chmod +x ./gradlew
-            ./gradlew testDebugUnitTest --no-daemon --stacktrace
-          else
-            gradle testDebugUnitTest --no-daemon --stacktrace
-          fi
+          set -o pipefail
+          gradle --version
+          gradle assembleRelease --no-daemon --stacktrace --console=plain 2>&1 | tee "$RUNNER_TEMP/build.log"
 
-      - name: Build release APK
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Show the real error if the build failed
+        if: failure()
         run: |
-          set -e
-          if [ -f ./gradlew ]; then
-            ./gradlew assembleRelease --no-daemon --stacktrace
-          else
-            gradle assembleRelease --no-daemon --stacktrace
-          fi
+          echo "### Gradle error summary" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          { grep -n -B2 -A14 "What went wrong" "$RUNNER_TEMP/build.log" || grep -n "^e: \|error:" "$RUNNER_TEMP/build.log" | head -40; } | head -80 >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Prepare signing key
+      - name: Unit tests (do not block the APK)
+        id: unit
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle testDebugUnitTest --no-daemon --stacktrace --console=plain
+
+      - name: Restore keystore and verify it (nothing is printed)
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS_V: ${{ secrets.KEY_ALIAS }}
         run: |
-          set -euo pipefail
-
-          mkdir -p "$RUNNER_TEMP/signing"
-
-          if [ -z "${KEYSTORE_BASE64:-}" ]; then
-            echo "::error::Missing KEYSTORE_BASE64 GitHub Secret."
-            exit 1
-          fi
-
-          echo "$KEYSTORE_BASE64" | base64 --decode \
-            > "$RUNNER_TEMP/signing/release.jks"
-
-          test -s "$RUNNER_TEMP/signing/release.jks"
-
-          echo "KS_PATH=$RUNNER_TEMP/signing/release.jks" >> "$GITHUB_ENV"
+          set -e
+          printf '%s' "$KEYSTORE_BASE64" | tr -d ' \r\n' | base64 -d > "$RUNNER_TEMP/release.jks" \
+            || { echo "::error::KEYSTORE_BASE64 is not valid Base64"; exit 1; }
+          keytool -list -keystore "$RUNNER_TEMP/release.jks" -storepass:env KS_PASS -alias "$KEY_ALIAS_V" > /dev/null 2>&1 \
+            || { echo "::error::Keystore password or alias is wrong (check KEYSTORE_PASSWORD / KEY_ALIAS)"; exit 1; }
+          echo "Keystore OK"
 
       - name: Align and sign APK
         working-directory: ${{ env.PROJECT_DIR }}
         env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS_V: ${{ secrets.KEY_ALIAS }}
         run: |
-          set -euo pipefail
-
+          set -e
           BT="$ANDROID_HOME/build-tools/${BUILD_TOOLS}"
-          APK_DIR="app/build/outputs/apk/release"
-
-          if [ -z "${KEYSTORE_PASSWORD:-}" ] || \
-             [ -z "${KEY_ALIAS:-}" ] || \
-             [ -z "${KEY_PASSWORD:-}" ]; then
-            echo "::error::One or more signing Secrets are missing."
-            exit 1
-          fi
-
-          IN="$(find "$APK_DIR" -maxdepth 1 -type f \
-            -name '*.apk' ! -name '*-unsigned-aligned.apk' \
-            -print -quit)"
-
-          if [ -z "$IN" ]; then
-            echo "::error::No release APK found."
-            find app/build/outputs -type f -name '*.apk' || true
-            exit 1
-          fi
-
+          IN=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          test -n "$IN" || { echo "::error::No release APK found"; find app/build/outputs -type f; exit 1; }
+          echo "Input APK: $IN"
           mkdir -p "$GITHUB_WORKSPACE/out"
+          "$BT/zipalign" -f -p 4 "$IN" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks" --ks-key-alias "$KEY_ALIAS_V" \
+            --ks-pass env:KS_PASS --key-pass env:KEY_PASS \
+            --out "$GITHUB_WORKSPACE/out/SchoolLeague-release-signed.apk" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --verbose "$GITHUB_WORKSPACE/out/SchoolLeague-release-signed.apk" | head -8
 
-          "$BT/zipalign" -f -p 4 \
-            "$IN" "$RUNNER_TEMP/aligned.apk"
-
-          KS_PASS="$KEYSTORE_PASSWORD" \
-          KEY_PASS="$KEY_PASSWORD" \
-          "$BT/apksigner" sign \
-            --ks "$KS_PATH" \
-            --ks-key-alias "$KEY_ALIAS" \
-            --ks-pass env:KS_PASS \
-            --key-pass env:KEY_PASS \
-            --out "$GITHUB_WORKSPACE/out/SchoolLeague-release-signed.apk" \
-            "$RUNNER_TEMP/aligned.apk"
-
-          "$BT/apksigner" verify --verbose \
-            "$GITHUB_WORKSPACE/out/SchoolLeague-release-signed.apk"
-
-      - name: Clean up signing key
+      - name: Remove keystore
         if: always()
-        run: rm -rf "$RUNNER_TEMP/signing" "$RUNNER_TEMP/aligned.apk"
+        run: rm -f "$RUNNER_TEMP/release.jks"
 
       - name: Upload signed APK
-        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: SchoolLeague-signed-apk
+          name: SchoolLeague-release-signed
           path: out/SchoolLeague-release-signed.apk
           if-no-files-found: error
+
+      - name: Upload test reports and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-and-logs
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/reports/tests
+            ${{ env.PROJECT_DIR }}/app/build/test-results
+          if-no-files-found: ignore
+
+      - name: Mark run red if unit tests failed
+        if: steps.unit.outcome == 'failure'
+        run: |
+          echo "::error::APK was built and uploaded, but unit tests FAILED. Download 'test-reports-and-logs' to see which."
+          exit 1
