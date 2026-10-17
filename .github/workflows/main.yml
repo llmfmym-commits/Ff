@@ -8,7 +8,6 @@ permissions:
   contents: read
 
 env:
-  ZIP_NAME: SchoolLeague-final.zip
   BUILD_TOOLS: "34.0.0"
 
 jobs:
@@ -33,12 +32,17 @@ jobs:
           [ -n "$S4" ] || { echo "::error::Secret KEY_PASSWORD is empty or missing"; missing=1; }
           exit $missing
 
-      - name: Unzip project
+      - name: Unzip project (any .zip in repo root)
         run: |
           set -e
-          test -f "$ZIP_NAME" || { echo "::error::$ZIP_NAME not found in repository root"; ls -la; exit 1; }
+          echo "Files in repo root:"; ls -la
+          COUNT=$(find . -maxdepth 1 -type f -name "*.zip" | wc -l)
+          if [ "$COUNT" -eq 0 ]; then echo "::error::No .zip file found in repository root"; exit 1; fi
+          if [ "$COUNT" -gt 1 ]; then echo "::warning::More than one zip found; using the newest-named first one"; fi
+          ZIP=$(find . -maxdepth 1 -type f -name "*.zip" | sort | tail -n 1)
+          echo "Using zip: $ZIP"
           rm -rf extracted && mkdir extracted
-          unzip -q "$ZIP_NAME" -d extracted
+          unzip -q "$ZIP" -d extracted
           SETTINGS=$(find extracted -maxdepth 3 \( -name settings.gradle.kts -o -name settings.gradle \) | head -n 1)
           test -n "$SETTINGS" || { echo "::error::settings.gradle(.kts) not found inside zip"; find extracted -maxdepth 3; exit 1; }
           DIR=$(cd "$(dirname "$SETTINGS")" && pwd)
