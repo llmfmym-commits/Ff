@@ -15,8 +15,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
-      - name: Checkout
+      - name: Checkout (full history to pick the newest zip)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Check signing secrets exist (values are never printed)
         env:
@@ -32,23 +34,26 @@ jobs:
           [ -n "$S4" ] || { echo "::error::Secret KEY_PASSWORD is empty or missing"; missing=1; }
           exit $missing
 
-      - name: Unzip project (any .zip in repo root)
+      - name: Unzip project (newest committed .zip in repo root)
         run: |
           set -e
-          echo "Files in repo root:"; ls -la
-          COUNT=$(find . -maxdepth 1 -type f -name "*.zip" | wc -l)
-          if [ "$COUNT" -eq 0 ]; then echo "::error::No .zip file found in repository root"; exit 1; fi
-          if [ "$COUNT" -gt 1 ]; then echo "::warning::More than one zip found; using the newest-named first one"; fi
-          ZIP=$(find . -maxdepth 1 -type f -name "*.zip" | sort | tail -n 1)
-          echo "Using zip: $ZIP"
+          echo "Zip files in repo root:"
+          BEST=""; BEST_T=0
+          while IFS= read -r -d '' f; do
+            t=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
+            [ -n "$t" ] || t=0
+            echo "  $f  (commit time $t)"
+            if [ "$t" -ge "$BEST_T" ]; then BEST="$f"; BEST_T="$t"; fi
+          done < <(find . -maxdepth 1 -type f -name "*.zip" -print0)
+          test -n "$BEST" || { echo "::error::No .zip file found in repository root"; ls -la; exit 1; }
+          echo "Using zip: $BEST"
           rm -rf extracted && mkdir extracted
-          unzip -q "$ZIP" -d extracted
+          unzip -q "$BEST" -d extracted
           SETTINGS=$(find extracted -maxdepth 3 \( -name settings.gradle.kts -o -name settings.gradle \) | head -n 1)
           test -n "$SETTINGS" || { echo "::error::settings.gradle(.kts) not found inside zip"; find extracted -maxdepth 3; exit 1; }
           DIR=$(cd "$(dirname "$SETTINGS")" && pwd)
           echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
           echo "Project directory: $DIR"
-          echo "--- AGP / Kotlin versions:"; grep -n "version" "$DIR/build.gradle.kts" || true
           test -f "$DIR/app/build.gradle.kts" -o -f "$DIR/app/build.gradle" || { echo "::error::app module not found"; exit 1; }
 
       - name: Set up JDK 17
